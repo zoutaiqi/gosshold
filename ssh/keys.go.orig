@@ -1,0 +1,303 @@
+// Copyright 2012 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package ssh
+
+import (
+	"bytes"
+	"crypto/dsa"
+	"crypto/rsa"
+	"encoding/base64"
+	"math/big"
+)
+
+// Keytypes supported by OpenSSH 1.5.9
+const (
+	keyAlgoRSA      = "ssh-rsa"
+	keyAlgoDSA      = "ssh-dss"
+	keyAlgoECDSA256 = "ecdsa-sha2-nistp256"
+	keyAlgoECDSA384 = "ecdsa-sha2-nistp384"
+	keyAlgoECDSA521 = "ecdsa-sha2-nistp521"
+)
+
+// parsePubKey parses a public key according to RFC 4253, section 6.6.
+func parsePubKey(in []byte) (out interface{}, rest []byte, ok bool) {
+	algo, in, ok := parseString(in)
+	if !ok {
+		return
+	}
+
+	switch string(algo) {
+	case hostAlgoRSA:
+		return parseRSA(in)
+	case hostAlgoDSA:
+		return parseDSA(in)
+	case hostAlgoRSACertV01, hostAlgoDSACertV01:
+		return parseOpenSSHCertV01(in, string(algo))
+	}
+	panic("ssh: unknown public key type")
+}
+
+// parseRSA parses an RSA key according to RFC 4253, section 6.6.
+func parseRSA(in []byte) (out *rsa.PublicKey, rest []byte, ok bool) {
+	key := new(rsa.PublicKey)
+
+	bigE, in, ok := parseInt(in)
+	if !ok || bigE.BitLen() > 24 {
+		return
+	}
+	e := bigE.Int64()
+	if e < 3 || e&1 == 0 {
+		ok = false
+		return
+	}
+	key.E = int(e)
+
+	if key.N, in, ok = parseInt(in); !ok {
+		return
+	}
+
+	ok = true
+	return key, in, ok
+}
+
+// parseDSA parses an DSA key according to RFC 4253, section 6.6.
+func parseDSA(in []byte) (out *dsa.PublicKey, rest []byte, ok bool) {
+	key := new(dsa.PublicKey)
+
+	if key.P, in, ok = parseInt(in); !ok {
+		return
+	}
+
+	if key.Q, in, ok = parseInt(in); !ok {
+		return
+	}
+
+	if key.G, in, ok = parseInt(in); !ok {
+		return
+	}
+
+	if key.Y, in, ok = parseInt(in); !ok {
+		return
+	}
+
+	ok = true
+	return key, in, ok
+}
+
+// marshalPrivRSA serializes an RSA private key according to RFC 4253, section 6.6.
+func marshalPrivRSA(priv *rsa.PrivateKey) []byte {
+	e := new(big.Int).SetInt64(int64(priv.E))
+	length := stringLength(len(hostAlgoRSA))
+	length += intLength(e)
+	length += intLength(priv.N)
+
+	ret := make([]byte, length)
+	r := marshalString(ret, []byte(hostAlgoRSA))
+	r = marshalInt(r, e)
+	r = marshalInt(r, priv.N)
+
+	return ret
+}
+
+// marshalPubRSA serializes an RSA public key according to RFC 4253, section 6.6.
+func marshalPubRSA(key *rsa.PublicKey) []byte {
+	e := new(big.Int).SetInt64(int64(key.E))
+	length := intLength(e)
+	length += intLength(key.N)
+
+	ret := make([]byte, length)
+	r := marshalInt(ret, e)
+	r = marshalInt(r, key.N)
+
+	return ret
+}
+
+// marshalPubDSA serializes an DSA public key according to RFC 4253, section 6.6.
+func marshalPubDSA(key *dsa.PublicKey) []byte {
+	length := intLength(key.P)
+	length += intLength(key.Q)
+	length += intLength(key.G)
+	length += intLength(key.Y)
+
+	ret := make([]byte, length)
+	r := marshalInt(ret, key.P)
+	r = marshalInt(r, key.Q)
+	r = marshalInt(r, key.G)
+	marshalInt(r, key.Y)
+
+	return ret
+}
+
+// parseAuthorizedKey parses a public key in OpenSSH authorized_keys format
+// (see sshd(8) manual page). in contains the line after the options and key
+// type fields have been removed.
+func parseAuthorizedKey(in []byte) (out interface{}, comment string, ok bool) {
+	in = bytes.TrimSpace(in)
+
+	i := bytes.IndexAny(in, " \t")
+	if i == -1 {
+		i = len(in)
+	}
+	base64Key := in[:i]
+
+	key := make([]byte, base64.StdEncoding.DecodedLen(len(base64Key)))
+	n, err := base64.StdEncoding.Decode(key, base64Key)
+	if err != nil {
+		return
+	}
+	key = key[:n]
+	out, _, ok = parsePubKey(key)
+	if !ok {
+		return nil, "", false
+	}
+	comment = string(bytes.TrimSpace(in[i:]))
+	return
+}
+
+// ParseAuthorizedKeys parses a public key from an authorized_keys
+// file used in OpenSSH according to the sshd(8) manual page.
+func ParseAuthorizedKey(in []byte) (out interface{}, comment string, options []string, rest []byte, ok bool) {
+	for len(in) > 0 {
+		end := bytes.IndexByte(in, '\n')
+		if end != -1 {
+			rest = in[end+1:]
+			in = in[:end]
+		} else {
+			rest = nil
+		}
+
+		end = bytes.IndexByte(in, '\r')
+		if end != -1 {
+			in = in[:end]
+		}
+
+		in = bytes.TrimSpace(in)
+		if len(in) == 0 || in[0] == '#' {
+			in = rest
+			continue
+		}
+
+		i := bytes.IndexAny(in, " \t")
+		if i == -1 {
+			in = rest
+			continue
+		}
+
+		field := string(in[:i])
+		switch field {
+		case keyAlgoRSA, keyAlgoDSA:
+			out, comment, ok = parseAuthorizedKey(in[i:])
+			if ok {
+				return
+			}
+		case keyAlgoECDSA256, keyAlgoECDSA384, keyAlgoECDSA521:
+			// We don't support these keys.
+			in = rest
+			continue
+		}
+
+		// No key type recognised. Maybe there's an options field at
+		// the beginning.
+		var b byte
+		inQuote := false
+		var candidateOptions []string
+		optionStart := 0
+		for i, b = range in {
+			isEnd := !inQuote && (b == ' ' || b == '\t')
+			if (b == ',' && !inQuote) || isEnd {
+				if i-optionStart > 0 {
+					candidateOptions = append(candidateOptions, string(in[optionStart:i]))
+				}
+				optionStart = i + 1
+			}
+			if isEnd {
+				break
+			}
+			if b == '\\' && i+1 < len(in) && in[i+1] == '"' {
+				i++
+				continue
+			}
+			if b == '"' {
+				inQuote = !inQuote
+			}
+		}
+		for i < len(in) && (in[i] == ' ' || in[i] == '\t') {
+			i++
+		}
+		if i == len(in) {
+			// Invalid line: unmatched quote
+			in = rest
+			continue
+		}
+
+		in = in[i:]
+		i = bytes.IndexAny(in, " \t")
+		if i == -1 {
+			in = rest
+			continue
+		}
+
+		field = string(in[:i])
+		switch field {
+		case keyAlgoRSA, keyAlgoDSA:
+			out, comment, ok = parseAuthorizedKey(in[i:])
+			if ok {
+				options = candidateOptions
+				return
+			}
+		}
+
+		in = rest
+		continue
+	}
+
+	return
+}
+
+// ParsePublicKey parses an ssh public key formatted for use in
+// on the wire protocol of SSH.
+func ParsePublicKey(in []byte) (out interface{}, rest []byte, ok bool) {
+	return parsePubKey(in)
+}
+
+// MarshalAuthorizedKey returns a byte stream suitable for inclusion
+// in an OpenSSH authorized_keys file following the format specified
+// in the sshd(8) manual page.
+func MarshalAuthorizedKey(key interface{}) []byte {
+	b := &bytes.Buffer{}
+	switch keyType := key.(type) {
+	case *rsa.PublicKey:
+		b.WriteString(hostAlgoRSA)
+	case *dsa.PublicKey:
+		b.WriteString(hostAlgoDSA)
+	case *OpenSSHCertV01:
+		switch keyType.Key.(type) {
+		case *rsa.PublicKey:
+			b.WriteString(hostAlgoRSACertV01)
+		case *dsa.PublicKey:
+			b.WriteString(hostAlgoDSACertV01)
+		default:
+			panic("unexpected key type")
+		}
+	default:
+		panic("unexpected key type")
+	}
+
+	b.WriteByte(' ')
+	e := base64.NewEncoder(base64.StdEncoding, b)
+	e.Write(serializePublickey(key))
+	e.Close()
+	b.WriteByte('\n')
+	return b.Bytes()
+}
+
+// MarshalPublicKey serializes a *rsa.PublicKey, *dsa.PublicKey or
+// *OpenSSHCertV01 for use on the wire protocol of SSH.  It can be
+// used for comparison with the pubkey argument of ServerConfig's
+// PublickeyCallback as well as generating an authorized_keys or
+// host_keys file.
+func MarshalPublicKey(key interface{}) []byte {
+	return serializePublickey(key)
+}
