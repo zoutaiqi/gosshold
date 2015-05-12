@@ -1,0 +1,1 @@
+The go.crypto subrepo has long had an ssh package. For Go 1.3, it's getting a significant rework and significant API change. Users who wish to use the old code can use this repo which contains a snapshot prior to replacing it with the newer code.
